@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+INFO.txt
+
+# Development scripts
+make_zip.ps1
+build_segments.py
+train_model.py
+train_nn.py
+scrape_krisha.py
+krisha_parser.py
+make_sample_xlsx.py
+
+# Cache and temporary files
+*.log
+.cache/
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Empty directories
+$base/

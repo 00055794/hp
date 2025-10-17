@@ -1,0 +1,35 @@
+# Files to ignore when deploying to Render.com
+# This helps reduce slug size
+
+# Documentation
+*.md
+README.md
+INFO.txt
+
+# Development files
+*.ipynb
+krisha_scraper_runner.ipynb
+
+# Test and sample files
+template.csv
+make_sample_xlsx.py
+
+# Build scripts not needed in production
+make_zip.ps1
+build_segments.py
+train_model.py
+train_nn.py
+
+# Scraping tools not needed in production
+scrape_krisha.py
+krisha_parser.py
+krisha_scraper_runner.ipynb
+
+# Cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
