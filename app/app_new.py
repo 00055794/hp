@@ -26,11 +26,15 @@ st.title("KZ Real Estate Price Estimator")
 def load_pipeline():
     """Load the complete prediction pipeline once"""
     try:
+        # Get the directory where this script is located
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        parent_dir = os.path.dirname(app_dir)
+        
         pipeline = CompletePipeline(
-            model_dir="nn_model",
-            region_grid_lookup="region_grid_lookup.json",
-            region_grid_encoder="region_grid_encoder.json",
-            segments_geojson="../segments_fine_heuristic_polygons.geojson"
+            model_dir=os.path.join(app_dir, "nn_model"),
+            region_grid_lookup=os.path.join(app_dir, "region_grid_lookup.json"),
+            region_grid_encoder=os.path.join(app_dir, "region_grid_encoder.json"),
+            segments_geojson=os.path.join(parent_dir, "segments_fine_heuristic_polygons.geojson")
         )
         return pipeline, None
     except Exception as e:
