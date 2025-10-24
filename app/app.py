@@ -703,30 +703,35 @@ def parse_coords(text: str):
 
 
 def predict_on_df(pipeline, stats_idx, df_in: pd.DataFrame, nn_artifacts=None) -> pd.DataFrame:
+    """Predict prices using new pipeline that matches notebook exactly"""
+    from pipeline_complete import CompletePipeline
+    
     df, missing = validate_inputs(df_in)
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
-    # enrich with regional socio-economic features if available
-    if stats_idx is None:
-        df_aug = df.copy()
-        # add empty enrichment columns so UI remains consistent
-        for c in ["segment_code", "region_name", "srednmes_zarplata", "chislennost_naseleniya_092025"]:
-            if c not in df_aug.columns:
-                df_aug[c] = ["", "", float("nan"), float("nan")][["segment_code","region_name","srednmes_zarplata","chislennost_naseleniya_092025"].index(c)]
-    else:
-        df_aug = attach_region_features(df, stats_idx)
-    if nn_artifacts is not None:
-        # Apply NN categorical codes and predict (returns real KZT)
-        df_enc = nn_apply_cat_maps(df_aug, nn_artifacts.cat_maps)
-        preds = nn_predict_kzt(nn_artifacts, df_enc)
-    elif pipeline is not None:
-        # Fall back to classical pipeline
-        preds = predict_kzt(pipeline, df_aug)
-    else:
-        raise RuntimeError("No model available. Provide NN artifacts (NN_MODEL_DIR) or baseline model.joblib (MODEL_PATH).")
-    out = df_aug.copy()
-    out["pred_price_kzt"] = preds
-    return out
+    
+    # Use new pipeline for predictions
+    try:
+        # Initialize pipeline once
+        if not hasattr(predict_on_df, '_pipeline'):
+            predict_on_df._pipeline = CompletePipeline(
+                model_dir="nn_model",
+                region_grid_lookup="region_grid_lookup.json",
+                region_grid_encoder="region_grid_encoder.json",
+                segments_geojson="../segments_fine_heuristic_polygons.geojson"
+            )
+        
+        # Make predictions (pipeline handles feature engineering internally)
+        preds = predict_on_df._pipeline.predict_batch(df)
+        
+        # Prepare output with all features
+        out = df.copy()
+        out["pred_price_kzt"] = preds
+        
+        return out
+    except Exception as e:
+        st.error(f"Prediction error: {str(e)}")
+        raise
 
 
 model_path = os.environ.get("MODEL_PATH", os.path.join(os.path.dirname(__file__), "model.joblib"))
@@ -741,25 +746,23 @@ nn_artifacts_cached = get_nn_artifacts()
 if not os.path.exists(model_path):
     if nn_artifacts_cached is None:
         st.warning("No baseline model found. Either train NN (train_nn.py) and set NN_MODEL_DIR, or train baseline (train_model.py). Proceeding without baseline.")
-if not os.path.exists(stats_path):
-    st.warning("Stats Excel (Stat_KZ092025.xlsx) not found. Place it in app folder or parent 102025, or set STATS_XLSX env var.")
 
+# Initialize session defaults for coordinates
+if "LATITUDE" not in st.session_state:
+    st.session_state["LATITUDE"] = 43.238
+if "LONGITUDE" not in st.session_state:
+    st.session_state["LONGITUDE"] = 76.886
+
+# Two-column layout: Single prediction (left) | Batch upload (right)
 colA, colB = st.columns([1, 1])
 
 with colA:
     st.subheader("Single Prediction")
-    # Initialize session defaults for coordinates
-    if "LATITUDE" not in st.session_state:
-        st.session_state["LATITUDE"] = 43.238
-    if "LONGITUDE" not in st.session_state:
-        st.session_state["LONGITUDE"] = 76.886
-
-    # In-map search and picker
-    with st.expander("Pick coordinates", expanded=True):
-        st.caption("Use the search box on the map to find a place, then click on the map to set coordinates.")
+    
+    # Compact map picker
+    with st.expander("📍 Map", expanded=False):
         pick_lat = st.session_state.get("LATITUDE", 43.238)
         pick_lon = st.session_state.get("LONGITUDE", 76.886)
-        # If a prediction exists, center map tighter on that point
         _pred_df = st.session_state.get("single_pred_df")
         if isinstance(_pred_df, pd.DataFrame) and not _pred_df.empty:
             try:
@@ -772,7 +775,6 @@ with colA:
         else:
             _zoom = 12
         mp = folium.Map(location=[pick_lat, pick_lon], zoom_start=_zoom, tiles=None)
-        # Prefer Esri Satellite visible by default, OSM available via control
         folium.TileLayer(
             tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
             attr="Tiles &copy; Esri",
@@ -782,21 +784,8 @@ with colA:
             show=True,
         ).add_to(mp)
         folium.TileLayer("OpenStreetMap", name="OSM", overlay=False, control=True, show=False).add_to(mp)
-        # Show coordinates under cursor and on click popup
         MousePosition(position="topright", prefix="Lat/Lon:", separator=", ", num_digits=6).add_to(mp)
-        # In-map geocoder/search control
-        if _FoliumGeocoder is not None:
-            try:
-                _FoliumGeocoder(collapsed=False, add_marker=True, position="topleft", placeholder="Search place").add_to(mp)
-            except Exception:
-                pass
-        if _Fullscreen is not None:
-            try:
-                _Fullscreen(position="topright").add_to(mp)
-            except Exception:
-                pass
         folium.LatLngPopup().add_to(mp)
-        # If we have a prediction, show it as a styled marker with price
         single_pred = st.session_state.get("single_pred_df")
         if isinstance(single_pred, pd.DataFrame) and not single_pred.empty:
             try:
@@ -824,39 +813,36 @@ with colA:
         map_state = st_folium(
             mp,
             key="picker_map",
-            height=550,
+            height=350,
             use_container_width=True,
         )
-        # Extract click
+        # Extract click with full precision
         if map_state and isinstance(map_state, dict):
             click = map_state.get("last_clicked")
             if click and "lat" in click and "lng" in click:
-                st.session_state["LATITUDE"] = float(click["lat"])
-                st.session_state["LONGITUDE"] = float(click["lng"])
-                st.success(f"Selected: {st.session_state['LATITUDE']:.6f}, {st.session_state['LONGITUDE']:.6f}")
+                st.session_state["LATITUDE"] = click["lat"]
+                st.session_state["LONGITUDE"] = click["lng"]
+                st.success(f"📍 {st.session_state['LATITUDE']:.6f}, {st.session_state['LONGITUDE']:.6f}")
 
+    # Input form - compact layout
     with st.form("form_single"):
-        # Compact 3-column layout
-        r1c1, r1c2, r1c3 = st.columns(3)
-        ROOMS = r1c1.number_input("Rooms", min_value=1, max_value=10, value=2)
-        TOTAL_AREA = r1c2.number_input("Area (m²)", min_value=10.0, max_value=1000.0, value=60.0, step=1.0)
-        YEAR = r1c3.number_input("Year", min_value=1950, max_value=2100, value=2015)
+        # Compact 2-column layout for inputs
+        c1, c2 = st.columns(2)
+        ROOMS = c1.number_input("Rooms", 1, 10, 2)
+        TOTAL_AREA = c1.number_input("Area (m²)", 10.0, 1000.0, 60.0, 1.0)
+        FLOOR = c1.number_input("Floor", 1, 100, 5)
+        TOTAL_FLOORS = c1.number_input("Total floors", 1, 100, 9)
+        CEILING = c1.number_input("Ceiling (m)", 2.0, 5.0, 2.7, 0.1)
+        
+        YEAR = c2.number_input("Year", 1950, 2100, 2015)
+        MATERIAL = c2.selectbox("Material", ["Panel", "Brick", "Monolithic", "Mixed"], 1)
+        FURNITURE = c2.selectbox("Furniture", ["No", "Partial", "Full"], 0)
+        CONDITION = c2.selectbox("Condition", ["Needs renovation", "Good", "Excellent"], 1)
+        
+        LATITUDE = st.number_input("Latitude", value=float(st.session_state["LATITUDE"]), format="%.6f")
+        LONGITUDE = st.number_input("Longitude", value=float(st.session_state["LONGITUDE"]), format="%.6f")
 
-        r2c1, r2c2, r2c3 = st.columns(3)
-        FLOOR = r2c1.number_input("Floor", min_value=1, max_value=100, value=5)
-        TOTAL_FLOORS = r2c2.number_input("Total floors", min_value=1, max_value=100, value=9)
-        CEILING = r2c3.number_input("Ceiling (m)", min_value=2.0, max_value=5.0, value=2.7, step=0.1)
-
-        r3c1, r3c2, r3c3 = st.columns(3)
-        MATERIAL = r3c1.selectbox("Material", ["Panel", "Brick", "Monolithic", "Mixed"], index=1)
-        FURNITURE = r3c2.selectbox("Furniture", ["No", "Partial", "Full"], index=0)
-        CONDITION = r3c3.selectbox("Condition", ["Needs renovation", "Good", "Excellent"], index=1)
-
-        r4c1, r4c2 = st.columns(2)
-        LATITUDE = r4c1.number_input("Latitude", value=float(st.session_state["LATITUDE"]), help="Decimal degrees")
-        LONGITUDE = r4c2.number_input("Longitude", value=float(st.session_state["LONGITUDE"]), help="Decimal degrees")
-
-        submitted = st.form_submit_button("Predict")
+        submitted = st.form_submit_button("🔮 Predict Price", use_container_width=True)
 
     if submitted:
         try:
@@ -865,73 +851,66 @@ with colA:
                 stats_idx = get_stats_index(stats_path)
             except Exception:
                 stats_idx = None
-            df_row = pd.DataFrame([
-                {
-                    "ROOMS": ROOMS,
-                    "TOTAL_AREA": TOTAL_AREA,
-                    "FLOOR": FLOOR,
-                    "TOTAL_FLOORS": TOTAL_FLOORS,
-                    "FURNITURE": FURNITURE,
-                    "CONDITION": CONDITION,
-                    "CEILING": CEILING,
-                    "MATERIAL": MATERIAL,
-                    "YEAR": YEAR,
-                    "LATITUDE": LATITUDE,
-                    "LONGITUDE": LONGITUDE,
-                }
-            ])
+            df_row = pd.DataFrame([{
+                "ROOMS": ROOMS,
+                "TOTAL_AREA": TOTAL_AREA,
+                "FLOOR": FLOOR,
+                "TOTAL_FLOORS": TOTAL_FLOORS,
+                "FURNITURE": FURNITURE,
+                "CONDITION": CONDITION,
+                "CEILING": CEILING,
+                "MATERIAL": MATERIAL,
+                "YEAR": YEAR,
+                "LATITUDE": LATITUDE,
+                "LONGITUDE": LONGITUDE,
+            }])
             out = predict_on_df(pipeline, stats_idx, df_row, nn_artifacts=nn_artifacts_cached)
-            # Remove enrichment columns from predictions
-            _drop_cols = [
-                "segment_code",
-                "region_name",
-                "srednmes_zarplata",
-                "chislennost_naseleniya_092025",
-            ]
+            _drop_cols = ["segment_code", "region_name", "srednmes_zarplata", "chislennost_naseleniya_092025"]
             out = out.drop(columns=[c for c in _drop_cols if c in out.columns])
             st.session_state["single_pred_df"] = out
-            st.success(f"Predicted price: {out.loc[0,'pred_price_kzt']:,.0f} KZT")
+            st.success(f"💰 {out.loc[0,'pred_price_kzt']:,.0f} KZT")
         except Exception as e:
             st.error(str(e))
 
-    # Persisted details (map above already shows result if available)
+    # Show details if available
     if "single_pred_df" in st.session_state:
         out = st.session_state["single_pred_df"]
-        with st.expander("Details", expanded=True):
-            cols = [c for c in [
-                "ROOMS","TOTAL_AREA","FLOOR","TOTAL_FLOORS","FURNITURE","CONDITION","CEILING","MATERIAL","YEAR","LATITUDE","LONGITUDE","pred_price_kzt"
-            ] if c in out.columns]
-            st.dataframe(out[cols])
+        with st.expander("📊 Details", expanded=False):
+            cols = [c for c in ["ROOMS","TOTAL_AREA","FLOOR","TOTAL_FLOORS","FURNITURE","CONDITION","CEILING","MATERIAL","YEAR","LATITUDE","LONGITUDE","pred_price_kzt"] if c in out.columns]
+            st.dataframe(out[cols], use_container_width=True)
 
+# Right column: Batch Upload
 with colB:
-    st.subheader("Batch Upload (CSV/XLSX)")
-    st.caption("Template columns: " + ", ".join(REQUIRED_FEATURES))
-    # Top row: uploader + side-by-side download buttons
-    up_col, dl_csv_col, dl_xlsx_col = st.columns([3, 1, 1])
-    upload = up_col.file_uploader("Drag and drop file here", type=["csv", "xlsx"], help="CSV or Excel (.xlsx)")
-    # Download buttons use session_state buffers when available
+    st.subheader("Batch Upload")
+    
+    upload = st.file_uploader("📤 Upload CSV/Excel", type=["csv", "xlsx"], help="Drag and drop or click to browse")
+    
+    # Download buttons for previous predictions
     b_csv = st.session_state.get("batch_csv_bytes")
     b_csv_name = st.session_state.get("batch_csv_name", "predictions.csv")
     b_xlsx = st.session_state.get("batch_xlsx_bytes")
     b_xlsx_name = st.session_state.get("batch_xlsx_name", "predictions.xlsx")
-    dl_csv_col.download_button(
-        label="Download predictions (CSV)",
+    
+    dl1, dl2 = st.columns(2)
+    dl1.download_button(
+        label="⬇️ CSV",
         data=(b_csv or b""),
         file_name=b_csv_name,
         mime="text/csv",
         disabled=(b_csv is None),
         use_container_width=True,
-        key="dl_batch_csv_toprow",
+        key="dl_batch_csv",
     )
-    dl_xlsx_col.download_button(
-        label="Download predictions (Excel)",
+    dl2.download_button(
+        label="⬇️ Excel",
         data=(b_xlsx or b""),
         file_name=b_xlsx_name,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         disabled=(b_xlsx is None),
         use_container_width=True,
-        key="dl_batch_xlsx_toprow",
+        key="dl_batch_xlsx",
     )
+
     if upload is not None:
         try:
             if upload.name.lower().endswith(".csv"):
@@ -944,21 +923,15 @@ with colB:
             except Exception:
                 stats_idx = None
             out = predict_on_df(pipeline, stats_idx, df_in, nn_artifacts=nn_artifacts_cached)
-            # Remove enrichment columns from predictions
-            _drop_cols = [
-                "segment_code",
-                "region_name",
-                "srednmes_zarplata",
-                "chislennost_naseleniya_092025",
-            ]
+            _drop_cols = ["segment_code", "region_name", "srednmes_zarplata", "chislennost_naseleniya_092025"]
             out = out.drop(columns=[c for c in _drop_cols if c in out.columns])
             st.session_state["batch_pred_df"] = out
-            st.success(f"Predicted {len(out)} rows.")
-            cols = [c for c in [
-                "ROOMS","TOTAL_AREA","FLOOR","TOTAL_FLOORS","FURNITURE","CONDITION","CEILING","MATERIAL","YEAR","LATITUDE","LONGITUDE","pred_price_kzt"
-            ] if c in out.columns]
-            st.dataframe(out[cols].head(50))
-            # Prepare downloads in session_state for the top-row buttons
+            st.success(f"✅ Predicted {len(out)} properties")
+            
+            cols = [c for c in ["ROOMS","TOTAL_AREA","FLOOR","TOTAL_FLOORS","FURNITURE","CONDITION","CEILING","MATERIAL","YEAR","LATITUDE","LONGITUDE","pred_price_kzt"] if c in out.columns]
+            st.dataframe(out[cols].head(50), use_container_width=True)
+            
+            # Prepare downloads
             csv_bytes = out.to_csv(index=False).encode("utf-8")
             st.session_state["batch_csv_bytes"] = csv_bytes
             _ts = time.strftime("%Y%m%d_%H%M%S")
@@ -968,36 +941,35 @@ with colB:
                 out.to_excel(writer, index=False, sheet_name="predictions")
             st.session_state["batch_xlsx_bytes"] = xlsx_buf.getvalue()
             st.session_state["batch_xlsx_name"] = f"houseprice_predictions_{_ts}.xlsx"
-            st.subheader("Map")
-            render_map(out)
-            # Compact template download under the batch map
-            with st.expander("Download batch template", expanded=False):
-                st.caption("CSV/XLSX headers for batch upload")
-                template_cols = [
-                    "ROOMS","TOTAL_AREA","FLOOR","TOTAL_FLOORS","FURNITURE","CONDITION","CEILING","MATERIAL","YEAR","LATITUDE","LONGITUDE"
-                ]
-                template_df = pd.DataFrame(columns=template_cols)
-                t1, t2 = st.columns(2)
-                t1.download_button(
-                    label="template.csv",
-                    data=template_df.to_csv(index=False).encode("utf-8"),
-                    file_name="template.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                    key="dl_template_csv_under_map",
-                )
-                xlsx_buf2 = io.BytesIO()
-                with pd.ExcelWriter(xlsx_buf2, engine="openpyxl") as writer:
-                    template_df.to_excel(writer, index=False, sheet_name="template")
-                t2.download_button(
-                    label="template.xlsx",
-                    data=xlsx_buf2.getvalue(),
-                    file_name="template.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                    key="dl_template_xlsx_under_map",
-                )
+            
+            # Show map
+            with st.expander("🗺️ View on Map", expanded=False):
+                render_map(out)
+            
         except Exception as e:
             st.error(str(e))
-
-# (Template download moved under the batch map)
+    
+    # Template download (always visible)
+    with st.expander("📥 Download Template", expanded=False):
+        template_cols = ["ROOMS","TOTAL_AREA","FLOOR","TOTAL_FLOORS","FURNITURE","CONDITION","CEILING","MATERIAL","YEAR","LATITUDE","LONGITUDE"]
+        template_df = pd.DataFrame(columns=template_cols)
+        t1, t2 = st.columns(2)
+        t1.download_button(
+            label="CSV",
+            data=template_df.to_csv(index=False).encode("utf-8"),
+            file_name="template.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="dl_template_csv",
+        )
+        xlsx_buf2 = io.BytesIO()
+        with pd.ExcelWriter(xlsx_buf2, engine="openpyxl") as writer:
+            template_df.to_excel(writer, index=False, sheet_name="template")
+        t2.download_button(
+            label="Excel",
+            data=xlsx_buf2.getvalue(),
+            file_name="template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="dl_template_xlsx",
+        )

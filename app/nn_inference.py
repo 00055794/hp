@@ -52,12 +52,80 @@ def load_artifacts(folder: str) -> NNArtifacts:
 
 
 def apply_cat_maps(df: pd.DataFrame, cat_maps: Dict[str, Dict[str, int]]) -> pd.DataFrame:
+    """Apply categorical mappings to a DataFrame.
+
+    Behavior:
+    - If a mapping for a column exists in `cat_maps`, use it.
+    - If mapping is missing but the column contains strings, try sensible default maps for
+      well-known columns (FURNITURE, MATERIAL). If still missing, attempt numeric coercion.
+    - As a last resort, create an on-the-fly factorized mapping (prints a warning).
+
+    This function mutates string/categorical columns into numeric columns in-place so the
+    feature matrix can be converted to float without TypeErrors.
+    """
     df = df.copy()
-    for col, mapping in cat_maps.items():
-        if col in df.columns:
-            df[f"{col}_CODE"] = df[col].map(mapping).fillna(-1).astype(int)
-        else:
-            df[f"{col}_CODE"] = -1
+
+    # Common sensible default mappings (1-based indexing as in training data)
+    # Based on training data: FURNITURE (1=No, 2=Partial, 3=Full)
+    # CONDITION (1-5 scale), MATERIAL (1=Panel, 2=Brick, 3=Monolithic, 4=Mixed)
+    DEFAULT_MAPS = {
+        "FURNITURE": {
+            "No": 1, "Partial": 2, "Full": 3,
+            "no": 1, "partial": 2, "full": 3,
+            "NO": 1, "PARTIAL": 2, "FULL": 3
+        },
+        "MATERIAL": {
+            "Panel": 1, "Brick": 2, "Monolithic": 3, "Mixed": 4,
+            "panel": 1, "brick": 2, "monolithic": 3, "mixed": 4,
+            "PANEL": 1, "BRICK": 2, "MONOLITHIC": 3, "MIXED": 4
+        },
+        "CONDITION": {
+            "Needs renovation": 1, "Needs Renovation": 1, "needs renovation": 1,
+            "Good": 2, "good": 2, "GOOD": 2,
+            "Excellent": 3, "excellent": 3, "EXCELLENT": 3,
+            # Extended scale if needed (training data has 1-5)
+            "Fair": 2, "fair": 2,
+            "Very Good": 4, "very good": 4,
+            "Perfect": 5, "perfect": 5
+        }
+    }
+
+    for col in set(list(cat_maps.keys()) + list(df.columns)):
+        if col not in df.columns:
+            # nothing to do for missing columns
+            continue
+
+        # If an explicit mapping exists, apply it
+        mapping = cat_maps.get(col) or cat_maps.get(col.upper()) or cat_maps.get(col.lower())
+        if mapping:
+            # map and coerce; unknowns become -1
+            df[col] = df[col].map(mapping).fillna(-1).astype(float)
+            continue
+
+        # If column is already numeric, skip
+        if pd.api.types.is_numeric_dtype(df[col].dtype):
+            continue
+
+        # Try default known mappings
+        if col in DEFAULT_MAPS:
+            df[col] = df[col].map(DEFAULT_MAPS[col]).fillna(-1).astype(float)
+            continue
+
+        # Try to coerce strings that look like numbers (e.g., "1", "2.0")
+        coerced = pd.to_numeric(df[col], errors="coerce")
+        if coerced.notna().all():
+            df[col] = coerced.astype(float)
+            continue
+
+        # Last resort: factorize and warn (mapping will be arbitrary and may not match training)
+        codes, uniques = pd.factorize(df[col].astype(str))
+        df[col] = codes.astype(float)
+        try:
+            uniq_map = {str(v): int(i) for i, v in enumerate(uniques)}
+        except Exception:
+            uniq_map = {str(v): int(i) for i, v in enumerate(uniques.tolist())}
+        print(f"[nn_inference] Warning: created on-the-fly mapping for '{col}': {uniq_map}")
+
     return df
 
 
@@ -66,7 +134,19 @@ def build_feature_matrix(df: pd.DataFrame, feature_list: List[str]) -> np.ndarra
     for c in feature_list:
         if c not in df.columns:
             df[c] = 0
-    return df[feature_list].astype(float).values
+    # Coerce to numeric safely; any remaining non-convertible values will become NaN
+    mat = df[feature_list].copy()
+    for c in mat.columns:
+        if not pd.api.types.is_numeric_dtype(mat[c].dtype):
+            mat[c] = pd.to_numeric(mat[c], errors="coerce")
+    if mat.isna().any().any():
+        # Replace NaNs with column medians (safe fallback) and warn
+        for col in mat.columns:
+            if mat[col].isna().any():
+                med = mat[col].median()
+                mat[col].fillna(med, inplace=True)
+                print(f"[nn_inference] Warning: filled NaNs in '{col}' with median={med}")
+    return mat.astype(float).values
 
 
 def predict_prices_kzt(art: NNArtifacts, df_features: pd.DataFrame) -> np.ndarray:

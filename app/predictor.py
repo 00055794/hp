@@ -6,6 +6,7 @@ from typing import List, Tuple, Optional
 import numpy as np
 import pandas as pd
 from joblib import load
+from region_grid import get_region_grid_lookup
 
 
 KZ_CENTER = (48.0196, 66.9237)  # lat, lon
@@ -99,32 +100,60 @@ REQUIRED_FEATURES = [
 
 
 def attach_region_features(df: pd.DataFrame, stats_index: RegionStatsIndex) -> pd.DataFrame:
+    """Add REGION_GRID and segment_code features from latitude/longitude coordinates.
+    
+    CRITICAL: Uses the SAME encodings as training data to ensure predictions match!
+    - REGION_GRID: Uses region_grid_lookup + region_grid_encoder mapping
+    - segment_code: Uses shapefile spatial join (same as training)
+    """
     df = df.copy()
-    segs = []
-    regions = []
-    sredn = []
-    chisl = []
-    for lat, lon in zip(df["LATITUDE"].astype(float), df["LONGITUDE"].astype(float)):
-        try:
-            seg, name, s, c = stats_index.nearest(lat, lon)
-        except Exception:
-            seg, name, s, c = ("", "", np.nan, np.nan)
-        segs.append(seg)
-        regions.append(name)
-        sredn.append(s)
-        chisl.append(c)
-    df["segment_code"] = segs
-    df["region_name"] = regions
-    df["srednmes_zarplata"] = sredn
-    df["chislennost_naseleniya_092025"] = chisl
-    # Optionally override segment_code using a shapefile if available
+    
+    # Get region grid lookup
+    region_grid_lookup = get_region_grid_lookup()
+    
+    # Calculate REGION_GRID from coordinates using grid lookup
+    # This returns region NAMES first
+    coords = list(zip(df["LATITUDE"].astype(float), df["LONGITUDE"].astype(float)))
+    region_codes = region_grid_lookup.batch_lookup_region_codes(coords)
+    df["REGION_GRID"] = region_codes
+    
+    # Calculate segment_code using shapefile (SAME method as training!)
     df = _maybe_assign_segment_from_shapefile(df)
-    # Ensure numeric code
+    
+    # If shapefile method didn't work, try stats_index as fallback
+    if "segment_code" not in df.columns or df["segment_code"].isna().all():
+        segs = []
+        for lat, lon in zip(df["LATITUDE"].astype(float), df["LONGITUDE"].astype(float)):
+            try:
+                seg, _, _, _ = stats_index.nearest(lat, lon)
+            except Exception:
+                seg = ""
+            segs.append(seg)
+        df["segment_code"] = segs
+    
+    # Ensure numeric codes
     if "segment_code" in df.columns:
         try:
             df["segment_code"] = pd.to_numeric(df["segment_code"], errors="coerce").fillna(-1).astype(int)
         except Exception:
             df["segment_code"] = -1
+    
+    # Ensure REGION_GRID is int32
+    df["REGION_GRID"] = df["REGION_GRID"].astype("int32")
+    df["segment_code"] = df["segment_code"].astype("int32")
+    
+    # Warn if any values are -1 (not found)
+    region_missing = (df["REGION_GRID"] == -1).sum()
+    segment_missing = (df["segment_code"] == -1).sum()
+    
+    if region_missing > 0:
+        print(f"⚠️  WARNING: {region_missing} rows have REGION_GRID=-1 (coordinates not in grid)")
+        print(f"   This will cause prediction errors! Check coordinates are within Kazakhstan.")
+    
+    if segment_missing > 0:
+        print(f"⚠️  WARNING: {segment_missing} rows have segment_code=-1 (no segment assigned)")
+        print(f"   Predictions may be less accurate.")
+    
     return df
 
 
@@ -164,7 +193,28 @@ def _maybe_assign_segment_from_shapefile(df: pd.DataFrame) -> pd.DataFrame:
             geometry=gpd.points_from_xy(df["LONGITUDE"].astype(float), df["LATITUDE"].astype(float)),
             crs="EPSG:4326",
         )
+        
+        # First try: spatial join with "within"
         joined = gpd.sjoin(pts, seg_gdf, how="left", predicate="within")
+        
+        # For points that didn't match, try nearest neighbor
+        unmatched_mask = joined['index_right'].isna() if 'index_right' in joined.columns else pd.Series([False] * len(joined))
+        if unmatched_mask.any():
+            # Find nearest polygon for unmatched points
+            unmatched_pts = pts[unmatched_mask]
+            for idx in unmatched_pts.index:
+                pt = unmatched_pts.loc[idx, 'geometry']
+                # Calculate distance to all polygons
+                distances = seg_gdf.geometry.distance(pt)
+                nearest_idx = distances.idxmin()
+                # Copy all columns from nearest polygon
+                for col in seg_gdf.columns:
+                    if col != 'geometry' and col not in joined.columns:
+                        if col not in joined.columns:
+                            joined[col] = None
+                    if col != 'geometry':
+                        joined.at[idx, col] = seg_gdf.at[nearest_idx, col]
+        
         # Try to pick a reasonable segment id/code column
         cand_cols = [
             "segment_id",
