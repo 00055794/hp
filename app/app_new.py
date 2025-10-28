@@ -186,7 +186,14 @@ with col_batch:
     
     if upload is not None:
         try:
-            df_in = pd.read_csv(upload)
+            # Read CSV with full float precision for lat/lon
+            df_in = pd.read_csv(upload, float_precision='high')
+            
+            # Ensure lat/lon have full precision (not rounded)
+            if 'LATITUDE' in df_in.columns:
+                df_in['LATITUDE'] = df_in['LATITUDE'].astype(float)
+            if 'LONGITUDE' in df_in.columns:
+                df_in['LONGITUDE'] = df_in['LONGITUDE'].astype(float)
             
             # Make predictions
             predictions_kzt = pipeline.predict_batch(df_in)
@@ -199,11 +206,14 @@ with col_batch:
             
             # Show results with all input features + prediction
             display_cols = [c for c in ["ROOMS", "LONGITUDE", "LATITUDE", "TOTAL_AREA", "FLOOR", "TOTAL_FLOORS", "FURNITURE", "CONDITION", "CEILING", "MATERIAL", "YEAR", "pred_price_kzt"] if c in df_out.columns]
-            st.dataframe(df_out[display_cols].head(50), use_container_width=True)
             
-            # Prepare download
+            # Format display to show full lat/lon precision
+            df_display = df_out[display_cols].head(50).copy()
+            st.dataframe(df_display, use_container_width=True)
+            
+            # Prepare download with full precision
             import time
-            csv_bytes = df_out.to_csv(index=False).encode("utf-8")
+            csv_bytes = df_out.to_csv(index=False, float_format='%.10f').encode("utf-8")
             st.session_state["batch_csv_bytes"] = csv_bytes
             _ts = time.strftime("%Y%m%d_%H%M%S")
             st.session_state["batch_csv_name"] = f"predictions_{_ts}.csv"
